@@ -5,31 +5,31 @@
     "checkpoint_parameters": 3143280,
     "ranking": "base checkpoint only; no pairwise preference reranker",
     "pairwise_mode_opt_in": "TINY_SHELL_PAIRWISE=1",
-    "candidate_source": "local candidates checked with bash -n"
+    "candidate_source": "Deterministic local candidates checked with bash -n; includes existing paths, installed commands, local Git refs, concrete SSH aliases, and safe flags; model ranks grounded candidates only"
   },
   "machine_measurements": {
-    "startup_to_prompt_ms": 272.05,
-    "idle_resident_memory_mb": {
-      "frontend_python": 65.47,
-      "bash_backend": 6.02,
-      "sum_of_process_rss": 71.49
+    "status": "updated build; direct engine benchmark only",
+    "environment": {
+      "python": "3.14",
+      "measurement_method": "in-process, 100 uncached SuggestionEngine.suggest calls across 20 fixed prefixes"
     },
-    "typed_prefix_to_ghost_text_update_ms": {
-      "samples": 20,
-      "example_case": "a locally available command-word completion",
-      "median": 26.16,
-      "p95": 27.93
+    "engine_load_ms": 85.673,
+    "suggestion_engine_ms": {
+      "samples": 100,
+      "median": 8.198,
+      "p99": 72.36,
+      "scope": "candidate generation, syntax filtering, model scoring; excludes prompt_toolkit redraw and Bash/PTTY bridge"
     },
-    "tab_cycle_to_prompt_update_ms": {
-      "samples": 35,
-      "median": 0.12,
-      "p95": 2.15
+    "process_max_rss_mb": 51.2,
+    "not_measured": {
+      "full_shell_startup_to_prompt": true,
+      "per_keystroke_end_to_end_cost": true,
+      "idle_cpu": true,
+      "interactive_modelshell_ram": true
     },
-    "measurement_notes": [
-      "Measured through a pseudo-terminal with model state loaded once per shell session.",
-      "The typed-prefix measurement includes candidate generation, bash -n filtering, model ranking, and terminal redraw.",
-      "The Tab measurement cycles an already computed list of candidates.",
-      "These measurements are from the build before the candidate-pool and cycling fixes; the updated path has only had direct candidate smoke checks, not a new pseudo-terminal benchmark."
+    "notes": [
+      "Measurements are from this host and are not hardware-independent guarantees.",
+      "A pseudo-terminal automation run displayed the prompt but did not reliably drive the custom editor, so terminal-level latency and interaction claims were not inferred from it."
     ]
   },
   "offline_reference": {
@@ -43,10 +43,10 @@
       "overall_top10": 0.1997
     },
     "notes": [
-      "These are offline held-out results from the cybersecurity-lab command corpus, not live user feedback.",
-      "The candidate set lacked the target in most examples, so coverage limits overall recovery.",
-      "The base checkpoint is trained; benchmark wording calls it untrained only when preference reranking is disabled."
-    ]
+      "The original report records 1,733 examples and scores, but the referenced source report and benchmark examples are absent from this project.",
+      "Held-out split, prefix length, and possible overlap with training data cannot be verified. Do not treat these as validated benchmark results or real-world quality measurements."
+    ],
+    "status": "unverified; source report and examples are absent"
   },
   "live_user_trial": {
     "status": "pending user use",
@@ -72,20 +72,50 @@
         "privacy": "read locally; candidate text is not transmitted"
       },
       {
-        "source": "local username and hostname",
-        "use": "limited user/host argument completions",
-        "privacy": "read locally; not logged"
+        "source": "local Git refs",
+        "use": "complete branch/ref arguments from the current repository",
+        "privacy": "read from local Git metadata; not logged"
       },
       {
-        "source": "Bash history",
-        "use": "not used for model suggestions",
-        "privacy": "not read by ModelShell"
+        "source": "SSH config aliases",
+        "use": "complete configured host arguments",
+        "privacy": "read locally from ~/.ssh/config; wildcard patterns excluded"
+      },
+      {
+        "source": "Bash history (default-on, opt-out)",
+        "use": "rank already-grounded completions from recent prior commands",
+        "privacy": "History context is on by default; MODELSHELL_HISTORY_CONTEXT=0 disables it. A bounded HISTFILE tail is read into session memory; never sent or included in feedback; Bash may independently persist commands"
       }
     ],
     "real_world_quality_ablation": {
       "status": "not measured",
-      "reason": "the project contains no real-world participant command traces or controlled acceptance study",
-      "claim": "no improvement in real-world suggestion quality is claimed for these context sources"
+      "reason": "no real-world participant traces or controlled acceptance study are included",
+      "claim": "no real-world quality improvement is claimed"
+    }
+  },
+  "model_artifact": {
+    "file": "models/base_checkpoint.npz",
+    "file_size_bytes": 12951666,
+    "archive_format": "NumPy NPZ",
+    "array_dtype": "float32",
+    "stored_array_bytes": 13996800,
+    "note": "Tied input/output embedding is duplicated in the NPZ arrays; parameter count reports the tied embedding once."
+  },
+  "benchmark_validity": {
+    "status": "unverified",
+    "referenced_source_report_present": false,
+    "benchmark_examples_present": false,
+    "heldout_split_verifiable": false,
+    "prefix_length_verifiable": false,
+    "training_overlap_check_possible": false,
+    "details": "The report references four_way_qwen_ratings_report.json, which is not included. The reported heldout count and scores cannot be reproduced from this repository."
+  },
+  "baselines": {
+    "frequency_ranked_prefix_match": {
+      "status": "not measured"
+    },
+    "simple_ngram": {
+      "status": "not measured"
     }
   }
 }

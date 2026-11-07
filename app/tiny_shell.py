@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bash-backed interactive shell frontend with local model suggestions."""
 import asyncio
+import ctypes
 import html
 import json
 import os
@@ -9,6 +10,7 @@ import re
 import select
 import shutil
 import signal
+import shlex
 import sys
 import tempfile
 import termios
@@ -26,8 +28,8 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.layout.processors import Processor, Transformation
 
-from candidates import syntax_ok
-from engine import SuggestionEngine
+from candidates import syntax_ok, words
+from engine import HistoryContext, SuggestionEngine
 
 ROOT = Path(__file__).resolve().parents[1]
 ORIGINAL_TERM = os.environ.get("TERM")
@@ -110,6 +112,7 @@ class TrialSuggest(AutoSuggest):
         if document.cursor_position != len(document.text):
             return None
         line = document.text
+        self.state["risky"] = _danger_warning(line)
         if self.state.get("line") != line:
             self.state["line"] = line
             self.state["index"] = 0
@@ -130,6 +133,7 @@ class TrialSuggest(AutoSuggest):
             return None
         chosen = items[self.state["index"] % len(items)]
         if chosen.startswith(line) and len(chosen) > len(line):
+            self.state["risky"] = _danger_warning(chosen)
             self.state["active"] = True
             shown_key = (line, self.state["index"] % len(items))
             if self.state.get("shown_key") != shown_key:
@@ -147,10 +151,49 @@ class RankedGhost(Processor):
     def apply_transformation(self, transformation_input):
         fragments = transformation_input.fragments
         rank = min(9, max(0, int(self.state.get("index", 0))))
+        style = "class:warning-ghost" if self.state.get("risky") else f"class:rank-{rank}"
         return Transformation([
-            (f"class:rank-{rank}" if "auto-suggestion" in style else style, text)
-            for style, text, *rest in fragments
+            (style if "auto-suggestion" in token_style else token_style, text)
+            for token_style, text, *rest in fragments
         ])
+
+
+def _danger_warning(line):
+    """Return a short warning label for a few high-impact command patterns."""
+    try:
+        tokens = words(line)
+    except Exception:
+        tokens = line.split()
+    lowered = [token.lower() for token in tokens]
+    wrappers = {"sudo", "command", "env", "time", "nice", "nohup"}
+    separators = {"&&", "||", ";", "|", "&", "<", ">", ">>", "2>", "1>"}
+    for index, token in enumerate(lowered):
+        if index and lowered[index - 1] not in separators:
+            continue
+        executable_index = index
+        while executable_index < len(lowered) and (lowered[executable_index] in wrappers or lowered[executable_index].startswith("-")):
+            executable_index += 1
+        if executable_index >= len(lowered) or lowered[executable_index] in separators:
+            continue
+        executable = os.path.basename(lowered[executable_index])
+        end = next((n for n in range(executable_index + 1, len(lowered)) if lowered[n] in separators), len(lowered))
+        arguments = lowered[executable_index + 1:end]
+        if executable == "dd":
+            return "disk-write command"
+        if executable.startswith("mkfs") or executable in {"wipefs", "fdisk", "parted", "shred"}:
+            return "disk or data destruction"
+        if executable == "rm":
+            short_flags = "".join(arg[1:] for arg in arguments if arg.startswith("-") and not arg.startswith("--"))
+            if "r" in short_flags and ("f" in short_flags or "--force" in arguments):
+                return "recursive forced deletion"
+            if "--recursive" in arguments and ("--force" in arguments or "f" in short_flags):
+                return "recursive forced deletion"
+        if executable == "chmod" and ("-r" in arguments or "--recursive" in arguments or
+                                      any(arg.startswith("-") and "r" in arg[1:] for arg in arguments)):
+            return "recursive permission change"
+    if re.search(r"\b(?:curl|wget)\b[^|]*\|\s*(?:(?:sudo)\s+)?(?:bash|sh)\b", line, re.IGNORECASE):
+        return "remote script execution"
+    return ""
 
 
 def styled_prompt():
@@ -196,8 +239,8 @@ def _read_state(fd):
     prompt_literal = PROMPT_TAG[1:-1]
     command = (" PROMPT_COMMAND=; "
                + "PS1=$'\\036" + prompt_literal + "\\037'; stty -echo; "
-               + "printf '\\036" + STATE_TAG[1:] + "%s\\037%s" + STATE_END.replace("\x1f", "\\037")
-               + "' \"$PWD\" \"$PATH\"\n")
+               + "printf '\\036" + STATE_TAG[1:] + "%s\\037%s\\037%s" + STATE_END.replace("\x1f", "\\037")
+               + "' \"$PWD\" \"$PATH\" \"${HISTFILE:-}\"\n")
     _write_all(fd, command.encode())
     data, ok = _read_until(fd, PROMPT_TAG.encode(), show=False)
     raw = data
@@ -208,15 +251,47 @@ def _read_state(fd):
     if end < 0:
         return ok
     payload = raw[start + len(STATE_TAG):end]
-    cwd, sep, path = payload.partition(b"\x1f")
+    cwd, sep, rest = payload.partition(b"\x1f")
     if sep:
+        path, hist_sep, histfile = rest.partition(b"\x1f")
         try:
             os.chdir(os.fsdecode(cwd))
             os.environ["PWD"] = os.fsdecode(cwd)
             os.environ["PATH"] = os.fsdecode(path)
         except OSError:
             pass
-    return ok
+        return {"ok": ok, "histfile": os.fsdecode(histfile) if hist_sep else ""}
+    return {"ok": ok, "histfile": ""}
+
+
+def _capture_backend_environment(fd):
+    """Copy Bash's exported environment back before handing the terminal to Bash."""
+    env_fd, env_path = tempfile.mkstemp(prefix="modelshell-env-")
+    os.close(env_fd)
+    try:
+        quoted_path = shlex.quote(env_path)
+        command = ("while IFS= read -r name; do printf '%s=%s\\0' \"$name\" \"${!name}\"; done "
+                   f"< <(compgen -e) > {quoted_path}\n")
+        _write_all(fd, command.encode())
+        _, ok = _read_until(fd, PROMPT_TAG.encode(), show=False)
+        if not ok:
+            return False
+        payload = Path(env_path).read_bytes()
+        restored = {}
+        for entry in payload.split(b"\0"):
+            key, sep, value = entry.partition(b"=")
+            if sep and key:
+                restored[os.fsdecode(key)] = os.fsdecode(value)
+        os.environ.clear()
+        os.environ.update(restored)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            os.unlink(env_path)
+        except OSError:
+            pass
 
 
 def _write_rc(path):
@@ -253,7 +328,13 @@ def load_engine(root, pairwise=False):
         engine.fallbacks = 0
         engine.syntax_rejections = 0
         engine.pairwise = False
-        engine._cached = lambda line: __import__("candidates").candidates(line)[:10]
+        engine.history = HistoryContext()
+        engine.set_history_file = lambda path: engine.history.set_file(path)
+        engine.remember = lambda line: engine.history.remember(line)
+        def deterministic_suggestions(line):
+            options = engine.history.completions(line) + __import__("candidates").candidates(line)
+            return list(dict.fromkeys(options))
+        engine._cached = deterministic_suggestions
         engine.correction = SuggestionEngine.correction.__get__(engine, SuggestionEngine)
         return engine, True
 
@@ -277,18 +358,21 @@ async def _interactive_loop(fd, engine, feedback):
         # prompt_toolkit caches AutoSuggest output per buffer text. Cycling
         # does not change that text, so update the cached ghost explicitly.
         buffer.suggestion = Suggestion(selected[len(buffer.text):]) if selected.startswith(buffer.text) else None
+        state["risky"] = _danger_warning(selected)
         state["active"] = True
-        event.app.invalidate()
         return True
 
     @kb.add("tab")
     def _tab(event):
-        if not cycle(event, 1):
-            event.current_buffer.insert_text("\t")
+        # Tab is exclusively a suggestion-cycle key. Inserting a literal tab
+        # makes a stray control character visible as ^I in shell commands.
+        if cycle(event, 1):
+            event.app.invalidate()
 
     @kb.add("s-tab")
     def _shift_tab(event):
-        cycle(event, -1)
+        if cycle(event, -1):
+            event.app.invalidate()
 
     @kb.add("enter")
     def _enter(event):
@@ -314,6 +398,8 @@ async def _interactive_loop(fd, engine, feedback):
         buf = event.current_buffer
         suggestion = buf.suggestion
         if suggestion:
+            accepted_line = buf.text + suggestion.text
+            engine.remember_accepted(accepted_line)
             buf.insert_text(suggestion.text)
             feedback.add("suggestions_accepted")
             state["active"] = False
@@ -349,6 +435,8 @@ async def _interactive_loop(fd, engine, feedback):
     engine_lexer = TrialLexer(engine)
 
     def toolbar():
+        if state.get("risky"):
+            return HTML(f"<class:warning-toolbar>⚠ {html.escape(state['risky'])} — review before Enter</class:warning-toolbar>")
         items = state.get("items", [])
         count = len(items)
         position = (state.get("index", 0) % count + 1) if count else 0
@@ -420,9 +508,18 @@ async def _interactive_loop(fd, engine, feedback):
             line = "exit"
         if not line:
             continue
+        if line.strip() in {"bash", "/bin/bash"}:
+            _write_all(1, b"\r\nSwitching to regular Bash. Type `exit` to close the terminal.\r\n")
+            _capture_backend_environment(fd)
+            # Avoid auto-starting ModelShell again from the new Bash's .bashrc,
+            # while still allowing the user to launch it manually there.
+            os.environ.pop("MODELSHELL_ACTIVE", None)
+            os.environ["MODELSHELL_NO_AUTOSTART"] = "1"
+            return "bash"
         if state.get("active"):
             feedback.add("suggestions_dismissed")
         _write_all(1, b"\r\n")
+        engine.remember(line)
         _write_all(fd, line.encode("utf-8", "surrogateescape") + b"\n")
         alive = await run_bridge()
         if not alive:
@@ -430,7 +527,8 @@ async def _interactive_loop(fd, engine, feedback):
         _write_all(1, b"\r\n")
         # Pull cwd and PATH back from Bash so local file/command candidates stay current.
         try:
-            _read_state(fd)
+            shell_state = _read_state(fd)
+            engine.set_history_file(shell_state.get("histfile", ""))
             if hasattr(engine._cached, "cache_clear"):
                 engine._cached.cache_clear()
             if hasattr(engine.correction, "cache_clear"):
@@ -440,6 +538,22 @@ async def _interactive_loop(fd, engine, feedback):
 
 
 def main():
+    startup_launch = os.environ.pop("MODELSHELL_STARTUP_LAUNCH", None) == "1"
+    if os.environ.get("MODELSHELL_ACTIVE") == "1" and not startup_launch:
+        print("ModelShell is already running in this terminal.", file=sys.stderr)
+        return 0
+    # Give terminal process lists a useful name instead of the Python runtime.
+    try:
+        libc = ctypes.CDLL(None)
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_ulong,
+                               ctypes.c_ulong, ctypes.c_ulong]
+        libc.prctl.restype = ctypes.c_int
+        libc.prctl(15, b"modelshell", 0, 0, 0)
+    except (AttributeError, OSError):
+        pass
+    # Prevent ~/.bashrc startup hooks from recursively launching ModelShell
+    # when the user asks to switch to a normal Bash session.
+    os.environ["MODELSHELL_ACTIVE"] = "1"
     # Some embedded terminals label themselves "dumb" despite supporting ANSI.
     if os.environ.get("TERM", "") in {"", "dumb"}:
         os.environ["TERM"] = "xterm-256color"
@@ -450,7 +564,13 @@ def main():
     feedback = Feedback()
     engine, fallback = load_engine(ROOT, pairwise=os.environ.get("TINY_SHELL_PAIRWISE") == "1")
     print("ModelShell  ·  Ctrl+G: correct command typo  ·  Right Arrow: accept suggestion")
-    print("Suggestion color shows rank: greenish gray is higher, reddish gray is lower. Tab/Shift+Tab or ↑/↓ cycles.")
+    print("Suggestion color shows rank: greenish gray is higher, reddish gray is lower. Tab/Shift+Tab or ↑/↓ cycles all matches.")
+    if os.environ.get("MODELSHELL_LEARN_FROM_ACCEPTED") == "1":
+        print("Accepted-suggestion learning: ON (local only; disable with MODELSHELL_LEARN_FROM_ACCEPTED=0).")
+    else:
+        print("For local accepted-suggestion learning (opt in), start with MODELSHELL_LEARN_FROM_ACCEPTED=1 ~/.local/bin/modelshell.")
+    if os.environ.get("MODELSHELL_HISTORY_CONTEXT", "1") == "0":
+        print("Recent Bash history suggestions are off. Enable next time with: MODELSHELL_HISTORY_CONTEXT=1 ~/.local/bin/modelshell")
     if fallback and feedback.enabled:
         feedback.add("fallbacks")
     if not shutil.which("bash"):
@@ -461,6 +581,7 @@ def main():
     _write_rc(rc)
     pid = None
     master = None
+    switch_to_bash = False
     try:
         pid, master = pty.fork()
         if pid == 0:
@@ -477,8 +598,9 @@ def main():
             os.execvpe("bash", ["bash", "--noprofile", "--noediting", "--rcfile", rc, "-i"], env)
         os.set_blocking(master, True)
         _read_until(master, PROMPT_TAG.encode(), show=False)
-        _read_state(master)
-        asyncio.run(_interactive_loop(master, engine, feedback))
+        shell_state = _read_state(master)
+        engine.set_history_file(shell_state.get("histfile", ""))
+        switch_to_bash = asyncio.run(_interactive_loop(master, engine, feedback)) == "bash"
     finally:
         try:
             if master is not None:
@@ -495,12 +617,16 @@ def main():
             os.unlink(rc)
         except OSError:
             pass
+    if switch_to_bash:
+        os.execvpe("bash", ["bash", "-i"], os.environ.copy())
     return 0
 
 
 def _style_rules():
     """Build legible rank colors, with a neutral opt-out and user palette."""
-    rules = {"typo": "fg:#ff5555 underline", "bottom-toolbar": "fg:#aaaaaa bg:#202020"}
+    rules = {"typo": "fg:#ff5555 underline", "bottom-toolbar": "fg:#aaaaaa bg:#202020",
+             "warning-ghost": "fg:#ffd27f bg:#4b2929 bold underline",
+             "warning-toolbar": "fg:#ffd27f bg:#4b2929 bold"}
     if os.environ.get("MODELSHELL_COLOR", "1").lower() in {"0", "false", "no", "off"}:
         colors = ["#888888"] * 10
     elif os.environ.get("MODELSHELL_RANK_COLORS"):

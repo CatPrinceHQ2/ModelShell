@@ -10,7 +10,8 @@ from pathlib import Path
 from candidates import candidates, words, syntax_ok, SAFE_FLAGS
 from model import ShellModel
 
-MODEL_WORD = re.compile(r"^[A-Za-z][A-Za-z0-9_.+-]{0,39}/?$")
+HISTORY_LIMIT_BYTES = 256 * 1024
+HISTORY_LIMIT_LINES = 500
 
 
 def _argument_position(line):
@@ -24,6 +25,115 @@ def _argument_position(line):
             break
     wrappers = {"sudo", "command", "env", "time", "nice", "nohup"}
     return bool(segment and not (len(segment) == 1 and segment[0] in wrappers))
+
+
+class AcceptedContext:
+    """Opt-in local personalization from explicitly accepted ghost suggestions."""
+    LIMIT = 1000
+
+    def __init__(self):
+        self.enabled = os.environ.get("MODELSHELL_LEARN_FROM_ACCEPTED") == "1"
+        state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+        self.path = state_home / "modelshell" / "accepted_suggestions.json"
+        self.counts = Counter()
+        if self.enabled:
+            try:
+                payload = json.loads(self.path.read_text(encoding="utf-8"))
+                self.counts.update({line: max(0, int(count)) for line, count in payload.get("accepted", {}).items()
+                                    if isinstance(line, str) and isinstance(count, int) and len(line) <= 4096})
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+
+    def completions(self, line):
+        if not self.enabled:
+            return []
+        return sorted((text for text in self.counts if text.startswith(line) and len(text) > len(line)),
+                      key=lambda text: (-self.counts[text], text))
+
+    def remember(self, full_line):
+        if not self.enabled or not full_line.strip() or len(full_line) > 4096:
+            return
+        self.counts[full_line] += 1
+        if len(self.counts) > self.LIMIT:
+            self.counts = Counter(dict(self.counts.most_common(self.LIMIT)))
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
+        temp_path = None
+        try:
+            import tempfile
+            fd, temp_path = tempfile.mkstemp(prefix=".accepted-suggestions-", dir=self.path.parent)
+            with os.fdopen(fd, "w", encoding="utf-8") as target:
+                json.dump({"accepted": dict(self.counts)}, target, sort_keys=True)
+                target.write("\n")
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, self.path)
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+
+
+class HistoryContext:
+    """Bounded, in-memory Bash-history completion source; opt out with value 0."""
+    def __init__(self):
+        self.enabled = os.environ.get("MODELSHELL_HISTORY_CONTEXT", "1") != "0"
+        self.path = None
+        self.entries = []
+
+    def set_file(self, raw_path):
+        path = None
+        if self.enabled and raw_path:
+            path = Path(os.path.expandvars(os.path.expanduser(raw_path)))
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path = path.resolve(strict=False)
+        if path == self.path:
+            return
+        self.path = path
+        self.entries = []
+        if path is None:
+            return
+        try:
+            if not path.is_file():
+                return
+            with path.open("rb") as source:
+                size = source.seek(0, os.SEEK_END)
+                start = max(0, size - HISTORY_LIMIT_BYTES)
+                source.seek(start)
+                payload = source.read(HISTORY_LIMIT_BYTES)
+            if start:
+                payload = payload.partition(b"\n")[2]
+            lines = payload.decode("utf-8", "replace").splitlines()
+        except OSError:
+            return
+        for line in lines:
+            line = line.strip()
+            if not line or re.fullmatch(r"#\d+", line):
+                continue
+            self.entries.append(line)
+        self.entries = self.entries[-HISTORY_LIMIT_LINES:]
+
+    def remember(self, line):
+        if self.enabled and line.strip():
+            self.entries.append(line.strip())
+            self.entries = self.entries[-HISTORY_LIMIT_LINES:]
+
+    def completions(self, line):
+        """Return prior full commands matching the current input, most frequent/recent first."""
+        if not self.enabled or not self.entries:
+            return []
+        counts = Counter()
+        last_seen = {}
+        for index, command in enumerate(self.entries):
+            if not command.startswith(line) or len(command) <= len(line):
+                continue
+            counts[command] += 1
+            last_seen[command] = index
+        return sorted(counts, key=lambda item: (-counts[item], -last_seen[item], item))
+
+    def rank(self, line, grounded_options):
+        """Prefer history completions that also occur in the current candidate set."""
+        grounded = set(grounded_options)
+        return [item for item in self.completions(line) if item in grounded]
 
 
 class SuggestionEngine:
@@ -49,34 +159,35 @@ class SuggestionEngine:
                 self.frequency = Counter()
         self.fallbacks = 0
         self.syntax_rejections = 0
+        self.history = HistoryContext()
+        self.accepted = AcceptedContext()
         self._cached = lru_cache(maxsize=64)(self._suggest_uncached)
+
+    def set_history_file(self, path):
+        self.history.set_file(path)
+        if hasattr(self._cached, "cache_clear"):
+            self._cached.cache_clear()
+
+    def remember(self, line):
+        self.history.remember(line)
+        if hasattr(self._cached, "cache_clear"):
+            self._cached.cache_clear()
+
+    def remember_accepted(self, full_line):
+        self.accepted.remember(full_line)
+        if hasattr(self._cached, "cache_clear"):
+            self._cached.cache_clear()
 
     def suggest(self, line):
         try:
             return self._cached(line)
         except Exception:
             self.fallbacks += 1
-            return candidates(line)[:10]
+            return self.history.completions(line) + candidates(line)
 
     def _suggest_uncached(self, line):
-        options = candidates(line)
-        # The local candidate generator supplies installed commands, known
-        # flags, and filesystem entries. For arguments, expand a sparse pool
-        # with a bounded slice of the model vocabulary so the model can rank
-        # plausible next words even when the command has no hand-written map.
-        if _argument_position(line) and len(options) < 10:
-            trailing = bool(line) and line[-1].isspace()
-            prefix = "" if trailing else (words(line)[-1] if words(line) else "")
-            additions = []
-            for word in self.model.vocab_list:
-                if word in {"<pad>", "<unk>", "<bos>", "<eos>"}:
-                    continue
-                if not word.startswith(prefix) or word == prefix or not MODEL_WORD.fullmatch(word):
-                    continue
-                additions.append(line + word[len(prefix):])
-                if len(additions) >= 256:
-                    break
-            options = list(dict.fromkeys([*options, *additions]))
+        learned = self.accepted.completions(line)
+        options = list(dict.fromkeys(learned + self.history.completions(line) + candidates(line)))
         if not options:
             if not syntax_ok(line + "TINY_COMPLETION_TOKEN"):
                 self.syntax_rejections += 1
@@ -113,7 +224,11 @@ class SuggestionEngine:
                 rank_score = model_score
             scored.append((rank_score, model_score, option))
         scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
-        return [item[2] for item in scored[:10]]
+        model_ranked = [item[2] for item in scored]
+        accepted_ranked = [item for item in learned if item in options]
+        history_ranked = self.history.rank(line, options)
+        preferred = set(accepted_ranked + history_ranked)
+        return accepted_ranked + history_ranked + [item for item in model_ranked if item not in preferred]
 
     @lru_cache(maxsize=1024)
     def correction(self, line):

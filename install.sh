@@ -47,29 +47,50 @@ cat > "$launcher" <<'SH'
 #!/usr/bin/env bash
 # modelshell launcher
 set -e
+if [[ "${MODELSHELL_ACTIVE:-}" == 1 && "${MODELSHELL_STARTUP_LAUNCH:-}" != 1 ]]; then
+    echo "ModelShell is already running in this terminal." >&2
+    exit 0
+fi
+unset MODELSHELL_STARTUP_LAUNCH MODELSHELL_NO_AUTOSTART
 export PYTHONDONTWRITEBYTECODE=1
 bin_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd -- "${bin_dir}/../share/modelshell" && pwd)"
-exec "${TINY_SHELL_PYTHON:-python3}" "$project_dir/app/tiny_shell.py" "$@"
+exec -a modelshell "${TINY_SHELL_PYTHON:-python3}" "$project_dir/app/tiny_shell.py" "$@"
 SH
 chmod 755 "$launcher"
 echo "Installed ModelShell at: $launcher"
-if (( enable_startup )); then
+if (( enable_startup )) || { [[ -f "${HOME}/.bashrc" ]] && grep -Fq '# >>> ModelShell startup >>>' "${HOME}/.bashrc"; }; then
     bashrc="${HOME}/.bashrc"
     [[ -e "$bashrc" ]] || : > "$bashrc"
-    if ! grep -Fq '# >>> ModelShell startup >>>' "$bashrc"; then
-        launcher_quoted="$(printf '%q' "$launcher")"
-        cat >> "$bashrc" <<RC
-
+    launcher_quoted="$(printf '%q' "$launcher")"
+    block_file="$(mktemp "${HOME}/.bashrc.modelshell-block.XXXXXX")"
+    cat > "$block_file" <<RC
 # >>> ModelShell startup >>>
-if [[ \$- == *i* && -z \${MODELSHELL_ACTIVE:-} && -t 1 ]]; then
-    export MODELSHELL_ACTIVE=1
+if [[ \$- == *i* && -z \${MODELSHELL_ACTIVE:-} && -z \${MODELSHELL_NO_AUTOSTART:-} && -t 1 ]]; then
+    export MODELSHELL_STARTUP_LAUNCH=1
     exec ${launcher_quoted}
 fi
 # <<< ModelShell startup <<<
 RC
+    if grep -Fq '# >>> ModelShell startup >>>' "$bashrc"; then
+        updated_bashrc="$(mktemp "${HOME}/.bashrc.modelshell.XXXXXX")"
+        awk '
+          $0 == "# >>> ModelShell startup >>>" { skip=1; next }
+          $0 == "# <<< ModelShell startup <<<" { skip=0; next }
+          !skip { print }
+        ' "$bashrc" > "$updated_bashrc"
+        printf '\n' >> "$updated_bashrc"
+        cat "$block_file" >> "$updated_bashrc"
+        chmod --reference="$bashrc" "$updated_bashrc"
+        cat "$updated_bashrc" > "$bashrc"
+        rm -f -- "$updated_bashrc"
+        rm -f -- "$block_file"
+    else
+        printf '\n' >> "$bashrc"
+        cat "$block_file" >> "$bashrc"
+        rm -f -- "$block_file"
     fi
-    echo "Interactive Bash startup enabled in $bashrc (remove with ./uninstall.sh)."
+    echo "Interactive Bash startup enabled or refreshed in $bashrc (remove with ./uninstall.sh)."
 else
     echo "Run with: $launcher"
     echo "Use --enable-startup to start ModelShell from interactive Bash terminals."

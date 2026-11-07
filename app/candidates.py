@@ -2,14 +2,13 @@
 """Suggest one locally available shell word; never executes suggestions."""
 import argparse
 from functools import lru_cache
-import getpass
 import glob
 import json
 import os
 import re
 import shlex
-import socket
 import subprocess
+from pathlib import Path
 
 SAFE_FLAGS = {
     "ls": "-la -l -a -h -R -t -r -S -d -F -1",
@@ -35,6 +34,13 @@ DISTRO_PACKAGE_MANAGER = {
     "fedora": "dnf", "rhel": "dnf", "centos": "dnf", "rocky": "dnf", "almalinux": "dnf",
     "opensuse": "zypper", "opensuse-leap": "zypper", "opensuse-tumbleweed": "zypper",
 }
+PATH_ARGUMENT_COMMANDS = {
+    ".", "bash", "cat", "cd", "chmod", "chown", "code", "cp", "du", "file", "find",
+    "grep", "head", "less", "ln", "ls", "mkdir", "mktemp", "more", "mv", "nano",
+    "nl", "python", "python2", "python3", "readlink", "realpath", "rm", "rmdir",
+    "rsync", "scp", "sed", "sh", "source", "stat", "tail", "tar", "touch", "tree",
+    "unlink", "unzip", "vim", "vi", "wc", "which", "xargs", "xdg-open", "zip",
+}
 
 
 @lru_cache(maxsize=1)
@@ -54,17 +60,40 @@ def system_context():
 
 
 @lru_cache(maxsize=1)
-def local_identity():
-    """Return local identity facts for completions; callers should not log these values."""
+def configured_ssh_hosts():
+    """Read concrete SSH aliases only; wildcard patterns are not suggestions."""
+    hosts = set()
+    config = Path.home() / ".ssh/config"
     try:
-        hostname = socket.gethostname()
+        lines = config.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        hostname = ""
+        return hosts
+    for line in lines:
+        try:
+            fields = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if len(fields) < 2 or fields[0].lower() != "host":
+            continue
+        hosts.update(value for value in fields[1:] if not any(char in value for char in "*!?"))
+    return hosts
+
+
+@lru_cache(maxsize=16)
+def git_branches(cwd):
+    """Return branch refs already present in this local repository."""
     try:
-        username = getpass.getuser()
-    except (OSError, KeyError):
-        username = os.environ.get("USER", "")
-    return username, hostname
+        result = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes"],
+            cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=0.2, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    return tuple(dict.fromkeys(
+        ref for ref in result.stdout.splitlines()
+        if ref and not ref.endswith("/HEAD")
+    ))
 
 
 def words(line):
@@ -118,23 +147,27 @@ def candidates(line):
         else:
             if command_only:
                 pool.update(SAFE_FLAGS.get(os.path.basename(command), "").split())
-            # Local file and directory names, including home-relative paths.
-            pattern = os.path.expanduser(prefix or "*")
-            pool.update(os.path.basename(p.rstrip("/")) + ("/" if os.path.isdir(p) else "")
-                        for p in glob.glob(pattern + "*") if os.path.basename(p.rstrip("/")))
-            if prefix.startswith("~"):
-                pool.add("~" + os.environ.get("USER", ""))
-            username, hostname = local_identity()
             command_name = os.path.basename(command)
-            if command_name in {"ssh", "scp", "sftp", "rsync", "ping", "curl", "wget"}:
-                if hostname:
-                    pool.add(hostname)
-                if username:
-                    pool.add(username)
-                    if hostname:
-                        pool.add(f"{username}@{hostname}")
-            elif command_name in {"chown", "chgrp", "su"} and username:
-                pool.add(username)
+            if command_name in {"ssh", "scp", "sftp", "rsync", "ping"}:
+                pool.update(configured_ssh_hosts())
+            if command_name == "git" and len(segment) >= 2 and segment[1] in {"checkout", "switch", "merge", "rebase"}:
+                pool.update(git_branches(os.getcwd()))
+            # Offer filesystem entries only in a command context that commonly
+            # accepts paths, or when the user has already typed a path-shaped prefix.
+            # This avoids suggesting e.g. `gh Downloads/` after `gh `.
+            path_context = command_name in PATH_ARGUMENT_COMMANDS or (
+                bool(prefix) and (prefix.startswith(("/", "./", "../", "~/")) or "/" in prefix)
+            )
+            if path_context:
+                expanded = os.path.expanduser(prefix or "*")
+                for path in glob.glob(expanded + "*"):
+                    if not os.path.exists(path):
+                        continue
+                    rendered = path
+                    home = str(Path.home())
+                    if prefix.startswith("~") and rendered.startswith(home + os.sep):
+                        rendered = "~" + rendered[len(home):]
+                    pool.add(rendered.rstrip("/") + ("/" if os.path.isdir(path) else ""))
     # Every accepted suggestion is a single plain shell word. One parse check
     # covers that token class and avoids launching Bash once per candidate.
     syntax_template_valid = syntax_ok(line + "TINY_COMPLETION_TOKEN")
@@ -143,6 +176,10 @@ def candidates(line):
     results = []
     for word in pool:
         if not word.startswith(prefix) or word == prefix or not SAFE_WORD.fullmatch(word):
+            continue
+        # Repeating the immediately previous token is almost never useful and
+        # caused the observed `path path path` suggestion loop.
+        if trailing and segment and segment[-1] not in OPS and word == segment[-1]:
             continue
         results.append(word)
     distro_id, package_manager = system_context()
