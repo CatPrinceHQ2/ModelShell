@@ -1,0 +1,26 @@
+{
+  "kind": "linear_pairwise_candidate_reranker",
+  "features": [
+    "base_model_log_probability",
+    "training_context_frequency_log1p"
+  ],
+  "weights": [
+    0.04528869,
+    0.01680227
+  ],
+  "feature_mean": [
+    0.0,
+    0.0
+  ],
+  "feature_scale": [
+    7.82799578,
+    1.6757772
+  ],
+  "training_comparisons": 870,
+  "rating_records_used": 4103,
+  "notes": [
+    "Only chosen-vs-rejected top suggestions and explicit C-order comparisons train this ranker.",
+    "T and N are retained as rating outcomes but do not create pairwise order constraints.",
+    "The language model checkpoint is not modified."
+  ]
+}

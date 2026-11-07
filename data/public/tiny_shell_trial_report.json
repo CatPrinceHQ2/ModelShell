@@ -1,0 +1,91 @@
+{
+  "report_type": "machine_trial_readiness",
+  "date": "2026-11-06",
+  "active_mode": {
+    "checkpoint_parameters": 3143280,
+    "ranking": "base checkpoint only; no pairwise preference reranker",
+    "pairwise_mode_opt_in": "TINY_SHELL_PAIRWISE=1",
+    "candidate_source": "local candidates checked with bash -n"
+  },
+  "machine_measurements": {
+    "startup_to_prompt_ms": 272.05,
+    "idle_resident_memory_mb": {
+      "frontend_python": 65.47,
+      "bash_backend": 6.02,
+      "sum_of_process_rss": 71.49
+    },
+    "typed_prefix_to_ghost_text_update_ms": {
+      "samples": 20,
+      "example_case": "a locally available command-word completion",
+      "median": 26.16,
+      "p95": 27.93
+    },
+    "tab_cycle_to_prompt_update_ms": {
+      "samples": 35,
+      "median": 0.12,
+      "p95": 2.15
+    },
+    "measurement_notes": [
+      "Measured through a pseudo-terminal with model state loaded once per shell session.",
+      "The typed-prefix measurement includes candidate generation, bash -n filtering, model ranking, and terminal redraw.",
+      "The Tab measurement cycles an already computed list of candidates.",
+      "These measurements are from the build before the candidate-pool and cycling fixes; the updated path has only had direct candidate smoke checks, not a new pseudo-terminal benchmark."
+    ]
+  },
+  "offline_reference": {
+    "source_report": "four_way_qwen_ratings_report.json",
+    "heldout_examples": 1733,
+    "sessions": 370,
+    "base_model_with_local_candidates_and_syntax_filter": {
+      "target_coverage": 0.3681,
+      "overall_top1": 0.0669,
+      "overall_top3": 0.1552,
+      "overall_top10": 0.1997
+    },
+    "notes": [
+      "These are offline held-out results from the cybersecurity-lab command corpus, not live user feedback.",
+      "The candidate set lacked the target in most examples, so coverage limits overall recovery.",
+      "The base checkpoint is trained; benchmark wording calls it untrained only when preference reranking is disabled."
+    ]
+  },
+  "live_user_trial": {
+    "status": "pending user use",
+    "shown_accepted_dismissed_counts": null,
+    "raw_command_or_identity_data_collected": false,
+    "default_feedback_enabled": false
+  },
+  "context_assessment": {
+    "current_sources": [
+      {
+        "source": "Linux distribution ID",
+        "use": "prioritize the matching package manager for sudo completions",
+        "privacy": "read locally from /etc/os-release; not logged"
+      },
+      {
+        "source": "PATH",
+        "use": "offer installed executable names",
+        "privacy": "read locally; candidate text is not transmitted"
+      },
+      {
+        "source": "current directory",
+        "use": "offer matching local file and directory names",
+        "privacy": "read locally; candidate text is not transmitted"
+      },
+      {
+        "source": "local username and hostname",
+        "use": "limited user/host argument completions",
+        "privacy": "read locally; not logged"
+      },
+      {
+        "source": "Bash history",
+        "use": "not used for model suggestions",
+        "privacy": "not read by ModelShell"
+      }
+    ],
+    "real_world_quality_ablation": {
+      "status": "not measured",
+      "reason": "the project contains no real-world participant command traces or controlled acceptance study",
+      "claim": "no improvement in real-world suggestion quality is claimed for these context sources"
+    }
+  }
+}
