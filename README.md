@@ -99,7 +99,7 @@ History can contain passwords, tokens, private paths, or other sensitive text. B
 MODELSHELL_HISTORY_CONTEXT=0 ~/.local/bin/modelshell
 ```
 
-[WRITE YOUR OWN SHORT PRIVACY NOTE: FOR EXAMPLE, WHETHER YOU USE THIS ON A SHARED COMPUTER AND WHAT YOU DO TO PROTECT YOUR HISTORY.]
+I use this own my own personal machine that nobody else uses so history is not personally an issue. It doesn't occur to me as something that should be too pertinent when using this shell but if your bash history is important DO beware especially on shared devices.
 
 ### Accepted-suggestion personalization (optional)
 
