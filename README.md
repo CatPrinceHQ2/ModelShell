@@ -1,108 +1,168 @@
 # ModelShell
 
-## Current implementation update — 2026-11-07
+One day I woke up and decided that a shell does not have to be deterministic. I wanted ALL the Linux commands!! Muahahaha... I'm such a great person. Anyways, professionally: 
 
-- **History suggestions are on by default.** At startup ModelShell reads up to 256 KiB / 500 lines from the active Bash `HISTFILE`, keeps the bounded entries in process memory, and suggests matching prior commands first. To opt out for a session, start it with `MODELSHELL_HISTORY_CONTEXT=0 ~/.local/bin/modelshell`. History stays local; Bash may still persist commands under its normal settings. History can contain secrets, so users who share a machine should consider disabling this feature.
-- **Suggestion cycling is uncapped.** Tab and Shift+Tab cycle through every result in the local candidate set. The model ranks those candidates; it does not make 256 separate requests. The model computes one vocabulary score vector when the input changes, then ranks candidate completions. The color palette still has ten tint bands, with later ranks using the last band.
-- **Path suggestions are context-aware.** ModelShell offers filesystem paths after common path-taking commands such as `ls`, `cd`, `cat`, `cp`, and `grep`, or when the typed prefix is already path-shaped. It should not suggest `Downloads/` after `gh `.
-- **Nested launches are guarded.** Running `modelshell` while ModelShell is already active prints a message instead of starting a second editor in the same terminal. If a ModelShell session is started automatically from `.bashrc`, the installer uses a one-time launch marker so the initial start is still allowed. The process is labeled `modelshell` to avoid a Python close prompt; the terminal emulator controls its own “process is running” close confirmation, so ModelShell cannot remove that prompt itself.
-- **Bare `bash` hands the terminal to regular Bash.** It preserves the current directory and exported environment. Type `exit` to close that terminal session. The launcher and Linux process are labeled `modelshell` instead of `python3`. This label does not suppress a terminal emulator’s “process is running” close confirmation; that behavior is controlled by the terminal emulator.
-- **Tab no longer inserts a literal tab.** If there are no suggestions, Tab does nothing instead of placing a `^I` in the command line. Tab cycling now requests a prompt_toolkit redraw after changing the selected item so the ghost suggestion and cursor stay synchronized; whether this resolves every terminal-specific cursor flicker still needs testing across terminals.
-- **Accepted-suggestion learning is available by opt-in.** Start with `MODELSHELL_LEARN_FROM_ACCEPTED=1 ~/.local/bin/modelshell`. Each Right Arrow/Ctrl+F acceptance is stored in `${XDG_STATE_HOME:-~/.local/state}/modelshell/accepted_suggestions.json` with owner-only permissions. The profile loads at startup and accepted completions rank first; it is separate from the bundled training/ranking data and never changes benchmark artifacts. It stores command text and may contain paths, hostnames, or secrets. Disable it by unsetting the variable or setting it to `0`; delete that JSON file to clear it. This is personalization, not a measured benchmark improvement.
-- **The bundled model is trained.** It has 3,143,280 parameters. `models/base_checkpoint.npz` is 12,951,666 bytes (about 12.35 MiB) and stores NumPy float32 arrays. The archive duplicates the tied embedding arrays even though the parameter count counts the tied weights once.
-- **Benchmark limits:** the repository does not include the benchmark examples or the referenced source report. The previously printed held-out scores, prefix lengths, and training overlap therefore cannot be verified from the repository. Do not treat the reported scores as validated results. The current direct engine benchmark measured 8.20 ms median / 72.36 ms p99 across 100 uncached prefixes on the development host; this excludes terminal redraw and the Bash/PTTY bridge.
+ModelShell is an interactive Linux shell which in essence aims to be somewhat similar to Fish shell, which uses a local language model and local context to suggest command continuations as you type. The goal is to preserve Bash behavior, and Bash is the backend for the thing. It's not a custom command workflow. Pretty much everything about Bash, including environment variables, job control, aliases, and interactive programs, should all work per usual.
 
-### Accuracy notes for statements retained below
+Suggestions appear as editable, gray, transparent text infront of what you have typed. ModelShell never executes a suggestion automatically. Typos get highlighted in red too.
 
-The original README text fetched from GitHub is retained below. These notes flag claims that are outdated, inaccurate, or unverifiable in the current implementation rather than silently removing them.
+This project is for anyone who feels like they want a terminal who feels truly alive. In my personal use as the dev (CatPrinceHQ) I can say that it really does feel that way. The terminal *sometimes* knows what I'm going to put down, even if it's something i've never typed before. It's truly incredible. Mind-reading like, maybe.
 
-- The introduction says suggestions are limited to “at most ten” results. That was the prior UI cap; cycling now includes every matching candidate.
-- The “Important Info” paragraph calls the bundled model “untrained.” The base checkpoint was trained on the attributed shell-command corpus. The separate preference reranker and its ratings are distinct artifacts; saying the checkpoint is untrained conflates them.
-- The same paragraph says the current terminal is identified as `python3`. The updated launcher sets its argv/process name to `modelshell`. Some terminal applications may still identify processes from the executable path, so this label change cannot guarantee the close-dialog wording on every desktop.
-- The requirements paragraph estimates “3.5MB or so” of RAM. That is not supported by the current measurements: the model archive is about 12.35 MiB, and the measured engine process reached 51.2 MiB maximum RSS on the development host. Full interactive-session RAM has not been measured.
-- The startup section says there are only ten candidates. That cap has been removed; the ten-color palette is only a set of rank tint bands.
-- The local-context paragraph says username and hostname feed suggestions. Those inputs have been removed; distribution ID, PATH, filesystem entries, Git refs, and configured SSH aliases are the current local candidate sources.
-- The history paragraphs say ModelShell does not read Bash history and suggest adding history support. That is now stale: history context is enabled by default, bounded to the recent tail described above, and can be disabled with `MODELSHELL_HISTORY_CONTEXT=0`.
-- The suggestion-quality paragraph calls the offline scores “held-out.” The data and referenced source report are absent, so the split, prefix lengths, and overlap with training cannot be checked. The held-out characterization is unverified, not a validated quality claim.
-- The limitations paragraph says vocabulary expansion may suggest arbitrary unsupported words. The current engine ranks locally generated candidates and matching history commands; it has no arbitrary model-generated fallback. Candidate coverage can still be incomplete, and `bash -n` is only a syntax check.
+## What it does
 
-ModelShell is an interactive Linux shell with a local next-part (not token, thank god) command suggestion AI, and a persistent Bash backend. Bash still executes your entered commands, so everything from Bash variables, functions, aliases, job control, and foreground interactive programs should work per usual. Suggestions are editable text only; they never execute automatically. Beware; this is stated more indirectly at the end, but I'm not responsible for damage this does if for some reason it suggests something like 'rm -rf' and you press Enter without review. Read Important Info farther down this README.
+- Uses local paths, installed commands, Git refs, SSH aliases, and Linux distribution information where relevant.
+- Lets you cycle through all available candidates and accept the visible suggestion.
+- Keeps the model in **RAM memory** for the duration of a ModelShell session. The overhead is tiny, it can run on pretty much anything. Don't worry about it eating your GPU. 
+- Runs commands normally with the same bash backend for familiar use.
 
-The bundled model has **3,143,280 parameters** (width 240, 4 layers, 4 attention heads; its tied input/output embedding is counted once). It was trained on a scrubbed subset of the public *Shell Commands Used by Participants of Hands-on Cybersecurity Training* dataset. That corpus consists of cybersecurity lab command histories and is not representative of all ordinary Linux use. The model predicts shell words; ModelShell combines that ranking with local candidates. The earlier ten-choice cap has been removed; cycling traverses the full candidate set. The optional pairwise reranker is a separate locally fit ranking component. Provenance is in [ATTRIBUTION.md](ATTRIBUTION.md).
+For those of you who think this project is useless, I can tell you specifically a good example of a usage that it helped me on.
+On a git push, it automatically suggested the next version number, using the previous one that I pushed as context. I thought it was super neat.
 
-# Important Info
-**Historical project note (partly outdated):** the following proof-of-concept warning reflects an earlier version. The bundled checkpoint is trained; see the accuracy notes above for what remains unverified.
+## Install
 
-ModelShell in it's current state is a proof of concept rather than something I expect people to use each day. Issue reports are great. If your system is beefy, a larger model, maybe 10M-20M parameters would benefit the program- but I didn't train one. You could definitely do it yourself though in substitution of the model I made. Just use Pytorch and a good dataset. The model is untrained (my pairwise judgements, in testing, actually made it's accuracy WORSE.) 
+### Requirements
 
-**Historical issue report:** the launcher and Linux process are now labeled `modelshell` to reduce Python process close prompts. Terminal-specific close-dialog behavior has not been verified across desktop environments.
-Yes, the project is aided by ChatGPT Codex. Yes, It's vibecoded. But i tested the thing myself for an extended period and did not see issues pop up, so I wouldn't worry about the fact that AI code can be unstable or vulnerable here.
+- Linux
+- Bash
+- Python 3
+- NumPy
+- prompt_toolkit
 
-## Requirements and install
-
-Linux with Bash, Python 3, NumPy, and prompt_toolkit are required. The model loads into the frontend process RAM once at session startup and remains available until that session exits. This creates overhead. The earlier “3.5MB” estimate is unsupported; see the current measured memory figures above. Install dependencies with your distribution package manager or `python3 -m pip install --user -r requirements.txt`. (Remember, run that from the project directory!)
-
-Speaking of the project directory, From it, you can install ModelShell and start it in future interactive Bash terminals with:
+Install the Python dependencies from the project directory if they are not already available:
 
 ```bash
-cd /path/to/project
+python3 -m pip install --user -r requirements.txt
+```
+
+Some distributions restrict `pip --user` for system Python. In that case, install NumPy and prompt_toolkit using your distribution’s packages or use a Python virtual environment.
+
+### Install and make ModelShell start in new Bash terminals
+
+From the directory containing this README and `install.sh`, run:
+
+```bash
+cd /path/to/ModelShell
 ./install.sh --enable-startup
 ```
 
-Replace `/path/to/project` with the directory containing this README and `install.sh`. For example, if you downloaded or cloned the project into `~/src/modelshell`, use `cd ~/src/modelshell`. The installer places the launcher in `~/.local/bin` and program/model files in `~/.local/share/modelshell`; the startup block uses the launcher's absolute path, so `~/.local/bin` does not need to be on `PATH` for automatic startup. The command above adds a marked, reversible block to `~/.bashrc`, so new interactive Bash terminals start ModelShell automatically.
+Replace `/path/to/ModelShell` with the directory where you cloned or unpacked this project. For example, if it is in `~/src/ModelShell`, use `cd ~/src/ModelShell`.
 
-The block starts ModelShell only for an interactive terminal and guards the Bash backend against launching a second ModelShell. If you use a terminal profile with a “custom command” field, you can instead set it to `~/.local/bin/modelshell`. This does not replace `/bin/bash` as the system login shell.
+The installer places the launcher at `~/.local/bin/modelshell` and the program files at `~/.local/share/modelshell`. It adds a marked block to `~/.bashrc` so new interactive Bash terminals open ModelShell. This does not change your system login shell. The startup block is reversible; see [Uninstall](#update-and-uninstall).
 
-For isolated installs, set `TINY_SHELL_PREFIX` to a user-owned directory before install and uninstall. Re-running the installer updates the managed installation; it refuses to replace unowned paths. The installer does not install Python packages itself.
+To install without automatic startup, run `./install.sh` and launch ModelShell with:
 
-## Startup and keys
+```bash
+~/.local/bin/modelshell
+```
 
-At startup, the help line describes the important features. The prompt is `username:`. Suggestions appear as gray-tinted ghost text after the cursor. Greenish gray indicates a higher rank; reddish gray indicates a lower rank. The ten tint bands do not limit the number of suggestions.
+If you use a terminal profile with a custom command setting, you can set it to `~/.local/bin/modelshell` instead.
+
+For a custom installation prefix, set `TINY_SHELL_PREFIX` before installing and use the same value when uninstalling. The installer does not install Python dependencies for you.
+
+I use Kitty Terminal on Arch Linux personally, it seemed to work as expected. I can't guarantee functionality for other distros or terminals.
+
+## Use it
+
+The prompt shows the username followed by a colon. Suggestions appear as tinted ghost text after the cursor. Greenish gray indicates a higher-ranked choice; reddish gray indicates a lower-ranked choice. The ten color tints are reused for lower ranks and do not limit the number of suggestions.
 
 | Key | Action |
 | --- | --- |
-| Right Arrow | Accept the visible suggestion at end of input |
-| Ctrl+F | Accept the visible suggestion (alternate binding) |
-| Tab / Shift+Tab | Cycle forward/backward through all available candidates |
-| Up / Down | Cycle suggestions when available; otherwise move through this session's in-memory input history |
+| Right Arrow | Accept the visible suggestion |
+| Ctrl+F | Accept the visible suggestion (alternate key) |
+| Tab / Shift+Tab | Cycle forward or backward through suggestions |
+| Up / Down | Cycle suggestions, or move through this session’s input history when no suggestions are available |
 | Ctrl+G | Correct an unambiguous likely typo in the first command word |
-| Enter | Send the visible editable line to Bash |
+| Enter | Send the editable input to Bash |
 | Ctrl+C | Cancel the current input |
 | Ctrl+D | Exit when the input is empty |
-| Ctrl+P / Ctrl+N | Move through this session's input history |
+| Ctrl+P / Ctrl+N | Move through this session’s input history |
 
-Suggestion colors can be disabled with `MODELSHELL_COLOR=0`. Set `MODELSHELL_RANK_COLORS` to a comma-separated palette of up to ten hex colors, for example `MODELSHELL_RANK_COLORS='#a8b5aa,#b5aaa8'`. A one-color palette uses the same color for all ranks. Model ranking is available by default; start with `TINY_SHELL_PAIRWISE=1 modelshell` to use the optional preference reranker.
+Disable suggestion colors with `MODELSHELL_COLOR=0`. Set `MODELSHELL_RANK_COLORS` to a comma-separated list of up to ten hex colors, for example:
+
+```bash
+MODELSHELL_RANK_COLORS='#a8b5aa,#b5aaa8' ~/.local/bin/modelshell
+```
+
+A one-color palette uses the same tint for every rank.
+
+A good tip is that if you aren't finding what you want suggested in one or two tabs, then just type one more letter of your next piece. Every letter narrows the result by a minimum of 26 times (alphabet math!)
 
 ## Local context and privacy
 
-ModelShell uses the current Linux distribution ID to prioritize its package manager after `sudo`. It also uses the current `PATH` to find installed executable names, the current directory for local file names, and a few local facts for relevant completions (for example the current username for `chown`). These values stay on the machine. No network service is contacted by the shell.
+### Bash history
 
-ModelShell sets GitHub CLI's `GH_ACCESSIBLE_PROMPTER=true` in the Bash backend by default. This uses GitHub's line-based accessible prompts, which avoid a terminal color-query reply issue that can otherwise make `gh auth login` abort in some terminal emulators. If you prefer GitHub's arrow-key menus, launch ModelShell with `MODELSHELL_GH_ACCESSIBLE_PROMPTER=0` or set that variable to `0` in your Bash startup file. An explicitly set `GH_ACCESSIBLE_PROMPTER` value takes precedence.
+History suggestions are enabled by default. At startup, ModelShell reads up to 500 lines or 256 KiB from the active Bash `HISTFILE`, whichever limit is reached first. It keeps those entries in session memory and ranks matching prior commands ahead of other candidates. History is processed locally and is not sent over the network.
 
-**Historical behavior (superseded):** ModelShell now reads a bounded recent tail of the active Bash `HISTFILE` by default; use `MODELSHELL_HISTORY_CONTEXT=0` to disable it. The following paragraphs describe the earlier behavior: ModelShell does **not** read `~/.bash_history` for suggestions. The input history shown by Up/Down or Ctrl+P/Ctrl+N is held in memory for the current ModelShell session. Commands are passed to interactive Bash, which follows its normal `HISTFILE` behavior and may append them to Bash history. Since no history-based suggestion mode is implemented, ModelShell does not expose history entries to the model. The backend reads `~/.bashrc` to retain user aliases and environment setup unless `TINY_SHELL_SKIP_BASHRC=1` is set. As with ordinary Bash startup, that file can itself run arbitrary user-configured commands.
+History can contain passwords, tokens, private paths, or other sensitive text. Bash may also persist commands using its normal history settings. To disable history suggestions for a session:
 
-**Historical suggestion (implemented since):** history-based suggestions are now implemented and enabled by default, with bounded local processing and the opt-out above. Not like the thing connects to the internet anyways, but I would just beware.
+```bash
+MODELSHELL_HISTORY_CONTEXT=0 ~/.local/bin/modelshell
+```
 
-Accepted-suggestion personalization is separately opt-in with `MODELSHELL_LEARN_FROM_ACCEPTED=1`; unlike aggregate feedback, this stores accepted command text locally. It is not merged into the shipped ranking JSON.
+[WRITE YOUR OWN SHORT PRIVACY NOTE: FOR EXAMPLE, WHETHER YOU USE THIS ON A SHARED COMPUTER AND WHAT YOU DO TO PROTECT YOUR HISTORY.]
 
-Optional aggregate feedback is off by default. Enable it with `MODELSHELL_FEEDBACK=1 modelshell`; it stores counts and suggestion latency in `${XDG_STATE_HOME:-~/.local/state}/modelshell/feedback.json` with owner-only directory permissions. The file contains no command text, paths, usernames, hostnames, or suggestion text. It stays local and is not transmitted. Remove the file to clear it.
+### Accepted-suggestion personalization (optional)
 
-## Update, uninstall, and recovery
+To remember suggestions you explicitly accept with Right Arrow or Ctrl+F, start ModelShell with:
 
-Run `./install.sh` again to update from a newer project copy. To uninstall:
+```bash
+MODELSHELL_LEARN_FROM_ACCEPTED=1 ~/.local/bin/modelshell
+```
+
+The local profile is stored at `${XDG_STATE_HOME:-~/.local/state}/modelshell/accepted_suggestions.json` with owner-only file permissions. It loads at startup and prioritizes previously accepted completions. It stores command text, which may include sensitive paths, hostnames, or secrets. It is separate from the shipped model and ranking data; it does not update the project’s training files or establish a benchmark improvement.
+
+Unset `MODELSHELL_LEARN_FROM_ACCEPTED` or set it to `0` to turn this feature off. Delete `accepted_suggestions.json` to erase the saved profile.
+
+### Other local sources
+
+ModelShell uses Linux distribution information to prioritize relevant package managers, `PATH` to find installed command names, the current directory for file and directory candidates, local Git refs for branch suggestions, and configured SSH aliases for host completion. Candidate generation aims to use context that exists on the machine. The shell itself does not contact a network service.
+
+ModelShell also sets GitHub CLI’s `GH_ACCESSIBLE_PROMPTER=true` in its Bash backend by default. This uses line-based prompts that avoid a terminal color-query issue observed with `gh auth login` in some terminal emulators. Set `MODELSHELL_GH_ACCESSIBLE_PROMPTER=0` to opt out. An explicitly set `GH_ACCESSIBLE_PROMPTER` value takes precedence.
+
+Optional aggregate feedback is off by default. Enable it with `MODELSHELL_FEEDBACK=1 ~/.local/bin/modelshell`. It records counts and suggestion latency in `${XDG_STATE_HOME:-~/.local/state}/modelshell/feedback.json`. It does not contain command text, paths, usernames, hostnames, or suggestion text, and is not transmitted. Delete that file to clear it.
+
+## The model
+
+The bundled base model has **3,143,280 parameters** (width 240, four layers, four attention heads; the tied input/output embedding is counted once). Its checkpoint is `models/base_checkpoint.npz`, a 12,951,666-byte NumPy archive containing float32 arrays. The archive stores the tied embedding arrays twice, although the parameter count counts the shared weights once.
+
+The model was trained on a scrubbed subset of [Shell Commands Used by Participants of Hands-on Cybersecurity Training](https://zenodo.org/records/6670113), a cybersecurity-lab command-history dataset. Those commands do not represent every kind of everyday Linux use. More information is in [ATTRIBUTION.md](ATTRIBUTION.md).
+
+The optional pairwise reranker is a separate component fit from local candidate ratings. It is off by default; enable it for a session with:
+
+```bash
+TINY_SHELL_PAIRWISE=1 ~/.local/bin/modelshell
+```
+
+[ADD A PERSONAL NOTE ABOUT WHAT YOU LEARNED WHILE TRAINING OR EVALUATING THE MODEL. AVOID CLAIMING RESULTS YOU HAVE NOT VERIFIED.]
+
+## Limitations and measurements
+
+- Candidate generation is conservative. It can omit valid commands or arguments, and syntax checking does not prove that a command is safe or will succeed.
+- Typo correction is limited to an unambiguous, likely one-edit typo in the first command word.
+- ModelShell uses its own editor; Bash Readline bindings and prompt hooks do not control that editor.
+- Terminal emulators can behave differently with the PTY bridge. Cursor flicker and close-confirmation behavior have not been verified across terminal applications. The process is labeled `modelshell`, but the emulator controls whether it asks you to confirm closing a terminal with a running process.
+- The repository does not include the examples or source report needed to verify previously reported held-out model scores. Do not treat those scores as a validated benchmark.
+- A direct engine benchmark on the development host measured 8.20 ms median and 72.36 ms p99 across 100 uncached prefixes. It excludes terminal redraw and the Bash/PTTY bridge and is not a hardware-independent guarantee. Full interactive-session memory, startup-to-prompt time, end-to-end per-keystroke latency, and idle CPU use have not been measured. The model archive size is not the same as runtime memory use.
+- No controlled real-world study has measured whether local context improves acceptance or command success. Accepted-suggestion personalization is intended to adapt locally, but its effect has not been measured.
+
+All issues are important to me, no matter how small. If you find one, PLEASE let me know!
+
+## Update and uninstall
+
+To update, run `./install.sh` again from a newer project copy. It refreshes the managed install and preserves the startup block if one is already enabled.
+
+To uninstall, run this from the project directory:
 
 ```bash
 ./uninstall.sh
 ```
 
-Uninstall removes only the managed launcher, installed program directory, and (if present) the marked ModelShell block in `~/.bashrc`. It leaves unrelated startup settings, Bash history, and project files in place. If you enabled startup, closing the current terminal or running `exec bash --noprofile` starts Bash without ModelShell after uninstall.
+Uninstall removes the managed launcher, installed program files, and marked ModelShell block from `~/.bashrc`. It leaves other Bash startup settings, Bash history, and the project directory untouched. You can also remove the marked block manually by deleting the lines between `# >>> ModelShell startup >>>` and `# <<< ModelShell startup <<<` in `~/.bashrc`.
 
-You can always run `/bin/bash` directly. To recover from a broken startup configuration, edit `~/.bashrc` and remove the block between `# >>> ModelShell startup >>>` and `# <<< ModelShell startup <<<`, or run the project's `./uninstall.sh`.
+I hope you enjoy using ModelShell, and I plan to fix any issues submitted to the project.
 
-## Suggestion quality and known limits
+## Contributing and project notes
 
-Local context sources are selected for usefulness and privacy: distribution ID helps choose a package manager, `PATH` and current-directory entries supply real local candidates, local Git refs and configured SSH aliases supply grounded arguments, and history ranks matching prior commands. **Historical text correction:** the prior username/hostname completion behavior has been removed; those values are not suggestion inputs. This release has no controlled real-world ablation showing that any context source improves user acceptance or command success. An older report records offline held-out results from the source cybersecurity-lab corpus; the source report and examples are absent, so the split and training overlap cannot be verified. These are not validated or real-world quality measurements. Earlier machine timings in that report were recorded on a prior build and should not be treated as current-build measurements.
+Users; please test the app rigourously. Even if you find the worlds' smallest issue with it, make an issue. I will fix it ASAP.
 
-Candidate generation is intentionally conservative and can omit valid commands or arguments. Vocabulary expansion can suggest a word that a particular command does not accept. `bash -n` checks syntax without running a command; it does not establish safety or success. Typo correction only considers a likely one-edit typo in the first command word and applies only an unambiguous installed-command match. Bash Readline bindings and prompt hooks do not control ModelShell's custom editor. Unusual terminal applications may interact differently with the PTY bridge.
-
-The checkpoint and training data attribution are documented, but the original code license has not been established in the supplied project. Choose and add a code license before publishing a public GitHub repository; do not treat the dataset's CC BY 4.0 terms as a license for the code or every generated artifact.
+The project is AI assisted by ChatGPT Codex and a local Qwen 4B model for pairwise ranking and shell project structuring. Model training was done by me personally
