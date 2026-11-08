@@ -133,7 +133,7 @@ The optional pairwise reranker is a separate component fit from local candidate 
 TINY_SHELL_PAIRWISE=1 ~/.local/bin/modelshell
 ```
 
-[ADD A PERSONAL NOTE ABOUT WHAT YOU LEARNED WHILE TRAINING OR EVALUATING THE MODEL. AVOID CLAIMING RESULTS YOU HAVE NOT VERIFIED.]
+Training the model was surprisingly quick, the model used in the project only took about a minute to train. Running Qwen 4B to do pairwise judgements was the harder part; that took nearly a day. And they didn't even significantly improve the model's accuracy. Waste of time xD
 
 ## Limitations and measurements
 
